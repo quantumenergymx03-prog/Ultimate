@@ -8474,8 +8474,47 @@ class MainApp:
             y_filt = y_smooth[keep_mask]
             radial_source = np.hypot(x_orig, y_orig)
             stack = np.vstack((x_filt, y_filt))
-            x_plot = x_filt
-            y_plot = y_filt
+            def _resample_path(x_vals: np.ndarray, y_vals: np.ndarray, limit: int = 850):
+                points = min(int(limit), int(min(x_vals.size, y_vals.size)))
+                if points <= 0:
+                    return x_vals, y_vals, np.linspace(0.0, 1.0, x_vals.size, dtype=float), np.arange(x_vals.size, dtype=float)
+                if x_vals.size <= points:
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                diffs_x = np.diff(x_vals)
+                diffs_y = np.diff(y_vals)
+                seg = np.hypot(diffs_x, diffs_y)
+                if not np.any(np.isfinite(seg)):
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                seg = np.nan_to_num(seg, nan=0.0, posinf=0.0, neginf=0.0)
+                cumulative = np.concatenate(([0.0], np.cumsum(seg)))
+                total = cumulative[-1]
+                if total <= 0:
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                target_dist = np.linspace(0.0, total, points)
+                x_res = np.interp(target_dist, cumulative, x_vals)
+                y_res = np.interp(target_dist, cumulative, y_vals)
+                idx_map = np.interp(target_dist, cumulative, np.arange(x_vals.size, dtype=float))
+                prog = target_dist / total
+                return x_res, y_res, prog, idx_map
+
+            def _center_curve(x_vals: np.ndarray, y_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+                if not x_vals.size or not y_vals.size:
+                    return x_vals, y_vals
+                return x_vals - np.nanmedian(x_vals), y_vals - np.nanmedian(y_vals)
+
+            x_centered, y_centered = _center_curve(x_filt, y_filt)
+            x_plot, y_plot, progress_map, sample_map = _resample_path(x_centered, y_centered)
+            if x_plot.size >= 11:
+                kernel = np.ones(11, dtype=float)
+                kernel = kernel / np.sum(kernel)
+                x_plot = np.convolve(x_plot, kernel, mode="same")
+                y_plot = np.convolve(y_plot, kernel, mode="same")
             overlay_original = False
             balance_note = None
             corr_val = None
@@ -8556,11 +8595,28 @@ class MainApp:
                 return shape, detail, color
 
             shape_label, shape_detail, shape_color = _orbit_interpretation(eig_ratio, corr_val)
+            radial_plot = np.hypot(x_plot, y_plot)
+            if radial_source.size and sample_map.size:
+                try:
+                    radial_labels = np.interp(sample_map, np.arange(radial_source.size, dtype=float), radial_source)
+                except Exception:
+                    radial_labels = radial_plot
+            else:
+                radial_labels = radial_plot
+            def _tone_color(hex_color: str, dark: bool, blend: float = 0.25) -> str:
+                try:
+                    base_rgb = np.array(mpl.colors.to_rgb(hex_color))
+                    background = "#0f141b" if dark else "#ffffff"
+                    bg_rgb = np.array(mpl.colors.to_rgb(background))
+                    mixed = np.clip(base_rgb * (1.0 - blend) + bg_rgb * blend, 0.0, 1.0)
+                    return mpl.colors.to_hex(mixed)
+                except Exception:
+                    return hex_color
             face = "#0f141b" if dark_mode else "white"
             fig, ax = plt.subplots(figsize=(6.4, 5.9))
             fig.patch.set_facecolor(face)
             ax.set_facecolor(face)
-            accent = shape_color if shape_color else self._accent_ui()
+            accent = _tone_color(shape_color if shape_color else self._accent_ui(), dark_mode, blend=0.2)
             if overlay_original:
                 ax.plot(
                     x_orig,
@@ -8571,17 +8627,16 @@ class MainApp:
                     label="Original (sin balance)",
                 )
             ax.plot(x_plot, y_plot, color=accent, linewidth=1.6, alpha=0.95)
-            progress = np.linspace(0.0, 1.0, x_plot.size, dtype=float)
             sc = ax.scatter(
                 x_plot,
                 y_plot,
-                c=progress,
+                c=progress_map,
                 cmap="plasma",
                 s=10,
                 alpha=0.6,
                 linewidths=0,
             )
-            radial = np.hypot(x_plot, y_plot)
+            radial = radial_plot
             try:
                 span = float(np.nanpercentile(np.concatenate((np.abs(x_plot), np.abs(y_plot))), 99.5))
             except Exception:
@@ -8596,8 +8651,8 @@ class MainApp:
                 top_n = min(3, radial.size)
                 peak_idx = np.argpartition(radial, -top_n)[-top_n:]
                 peak_idx = peak_idx[np.argsort(radial[peak_idx])[::-1]]
-                peak_face = "#f39c12" if not dark_mode else "#f1c40f"
-                edge = "#2c3e50" if not dark_mode else "#1a252f"
+                peak_face = _tone_color("#f39c12" if not dark_mode else "#f1c40f", dark_mode, blend=0.15)
+                edge = _tone_color("#2c3e50" if not dark_mode else "#1a252f", dark_mode, blend=0.05)
                 ax.scatter(
                     x_plot[peak_idx],
                     y_plot[peak_idx],
@@ -8610,8 +8665,8 @@ class MainApp:
                     zorder=6,
                 )
             try:
-                start_color = "#27ae60" if not dark_mode else "#2ecc71"
-                end_color = "#c0392b" if not dark_mode else "#ff6b6b"
+                start_color = _tone_color("#1abc9c" if not dark_mode else "#48dbfb", dark_mode, blend=0.1)
+                end_color = _tone_color("#e74c3c" if not dark_mode else "#ff6b6b", dark_mode, blend=0.1)
                 ax.scatter([x_plot[0]], [y_plot[0]], color=start_color, s=54, label="Inicio")
                 ax.scatter([x_plot[-1]], [y_plot[-1]], color=end_color, s=54, label="Fin")
             except Exception:
@@ -8625,7 +8680,7 @@ class MainApp:
             ax.axvline(0.0, color=axis_color, linewidth=0.8, alpha=0.2)
             if peak_idx.size:
                 for idx_peak in peak_idx:
-                    raw_val = float(radial_source[idx_peak]) if idx_peak < radial_source.size else float(radial[idx_peak])
+                    raw_val = float(radial_labels[idx_peak]) if idx_peak < radial_labels.size else float(radial[idx_peak])
                     ax.text(
                         x_plot[idx_peak],
                         y_plot[idx_peak],
