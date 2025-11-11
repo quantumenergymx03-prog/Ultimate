@@ -8369,7 +8369,7 @@ class MainApp:
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                fig.tight_layout()
+                fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.98))
             return fig
         except Exception:
             return None
@@ -8522,11 +8522,44 @@ class MainApp:
                 y_plot = balanced[1]
                 overlay_original = True
                 balance_note = "Órbita auto-equilibrada (señales muy correlacionadas)"
+            def _orbit_interpretation(eig_ratio_val: Optional[float], corr: Optional[float]) -> Tuple[str, str, str]:
+                ratio = eig_ratio_val if eig_ratio_val is not None and np.isfinite(eig_ratio_val) else None
+                rho = corr if corr is not None and np.isfinite(corr) else None
+                shape = "Indeterminada"
+                detail = "datos insuficientes para clasificar la órbita."
+                color = "#3498db"
+                if rho is not None and abs(rho) >= 0.92:
+                    shape = "Lineal"
+                    detail = "trayectoria casi lineal — revisar alineación de sensores o rigidez excesiva."
+                    color = "#e74c3c"
+                    return shape, detail, color
+                if ratio is None:
+                    return shape, detail, color
+                if rho is not None and rho < -0.45 and ratio >= 1.6:
+                    shape = "Forma en 8"
+                    detail = "posible holgura o juego excesivo."
+                    color = "#e67e22"
+                    return shape, detail, color
+                if ratio < 1.4:
+                    shape = "Circular"
+                    detail = "balanceo predominante y movimiento uniforme."
+                    color = "#2ecc71"
+                elif ratio < 6.0:
+                    shape = "Elíptica"
+                    detail = "posible desalineación o rigidez desigual."
+                    color = "#f1c40f"
+                else:
+                    shape = "Distorsionada"
+                    detail = "órbita deformada — verificar holguras, impactos o resonancia."
+                    color = "#e67e22"
+                return shape, detail, color
+
+            shape_label, shape_detail, shape_color = _orbit_interpretation(eig_ratio, corr_val)
             face = "#0f141b" if dark_mode else "white"
             fig, ax = plt.subplots(figsize=(6, 6))
             fig.patch.set_facecolor(face)
             ax.set_facecolor(face)
-            accent = self._accent_ui()
+            accent = shape_color if shape_color else self._accent_ui()
             if overlay_original:
                 ax.plot(
                     x_orig,
@@ -8605,32 +8638,37 @@ class MainApp:
             for axis in [ax.xaxis, ax.yaxis]:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
-            info_lines = []
-            if corr_val is not None and np.isfinite(corr_val):
-                info_lines.append(f"ρ(X,Y) = {corr_val:.3f}")
-            if std_x is not None and std_y is not None and std_y > 0:
-                info_lines.append(f"σx/σy = {(std_x / std_y):.2f}")
-            if eig_ratio is not None and np.isfinite(eig_ratio):
-                info_lines.append(f"κ = {eig_ratio:.1f}")
-            if info_lines:
-                ax.text(
-                    0.02,
-                    0.98,
-                    "\n".join(info_lines),
-                    transform=ax.transAxes,
-                    fontsize=8,
-                    color=axis_color,
-                    va="top",
-                )
+            headline = f"Forma detectada: {shape_label} — {shape_detail}"
+            ax.text(
+                0.5,
+                1.05,
+                headline,
+                transform=ax.transAxes,
+                ha="center",
+                va="bottom",
+                color=shape_color,
+                fontsize=11,
+                fontweight="bold",
+            )
+            legend_text = "Forma: circular=balanceo | elíptica=desalineación | 8=holgura"
+            fig.text(
+                0.5,
+                0.02,
+                legend_text,
+                ha="center",
+                va="bottom",
+                color=axis_color,
+                fontsize=8,
+            )
             if balance_note:
-                ax.text(
-                    0.02,
-                    0.02,
+                fig.text(
+                    0.5,
+                    0.045,
                     balance_note,
-                    transform=ax.transAxes,
-                    fontsize=8,
-                    color=axis_color,
+                    ha="center",
                     va="bottom",
+                    fontsize=7,
+                    color=axis_color,
                     bbox=dict(
                         boxstyle="round,pad=0.25",
                         facecolor="#1b2633" if dark_mode else "white",
@@ -8649,7 +8687,7 @@ class MainApp:
                 ax.legend(loc="upper right", fontsize=8)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                fig.tight_layout()
+                fig.tight_layout(rect=(0.0, 0.1, 1.0, 0.94))
             return fig
         except Exception:
             return None
