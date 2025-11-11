@@ -15,6 +15,7 @@ import re
 import joblib
 import warnings
 import json
+import textwrap
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -3412,6 +3413,7 @@ class MainApp:
         env_hi: Optional[float],
         df: Optional[pd.DataFrame] = None,
         unit_map: Optional[Dict[str, str]] = None,
+        primary_axis: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         df_source = df if df is not None else getattr(self, "_raw_current_df", None)
         if df_source is None or getattr(df_source, "empty", True) or (time_col not in getattr(df_source, "columns", [])):
@@ -3436,6 +3438,8 @@ class MainApp:
             pass
         axis_summaries: List[Dict[str, Any]] = []
         rms_values: List[float] = []
+        primary_entry: Optional[Dict[str, Any]] = None
+        primary_axis_norm = str(primary_axis) if primary_axis is not None else None
         for col in axis_cols:
             try:
                 series = pd.to_numeric(df_source[col], errors="coerce")
@@ -3483,10 +3487,36 @@ class MainApp:
                 axis_rms = float(res_axis.get("severity", {}).get("rms_mm_s", 0.0))
                 iso_label = res_axis.get("severity", {}).get("label", "N/D")
                 color = res_axis.get("severity", {}).get("color", "#7f8c8d")
+                fft_payload = res_axis.get("fft", {}) if isinstance(res_axis, dict) else {}
+                energy_block = fft_payload.get("energy", {}) if isinstance(fft_payload, dict) else {}
+                total_energy = float(energy_block.get("total", 0.0)) if energy_block else 0.0
+                try:
+                    frac_high_axis = (
+                        float(energy_block.get("high", 0.0)) / total_energy
+                        if total_energy > 0
+                        else 0.0
+                    )
+                except Exception:
+                    frac_high_axis = 0.0
+                try:
+                    r2x_axis = float(fft_payload.get("r2x", 0.0))
+                except Exception:
+                    r2x_axis = 0.0
+                ml_bundle_axis = res_axis.get("ml", {}) if isinstance(res_axis, dict) else {}
+                ml_summary_axis = self._resolve_ml_summary(
+                    ml_bundle_axis,
+                    iso_label,
+                    frac_high_axis,
+                    r2x_axis,
+                )
             except Exception:
                 axis_rms = 0.0
                 iso_label = "N/D"
                 color = "#7f8c8d"
+                ml_bundle_axis = {}
+                ml_summary_axis = {}
+                frac_high_axis = 0.0
+                r2x_axis = 0.0
             emoji_label = self._classify_severity(axis_rms)
             debug_axis_msg = (
                 f"[DEBUG] RMS por eje {col}: {axis_rms:.6f} mm/s "
@@ -3501,9 +3531,18 @@ class MainApp:
                 "emoji_label": emoji_label,
                 "color": color,
                 "is_global": False,
+                "is_primary": bool(
+                    primary_axis_norm is not None and str(col) == primary_axis_norm
+                ),
+                "ml_bundle": ml_bundle_axis,
+                "ml_summary": ml_summary_axis,
+                "frac_high": float(max(frac_high_axis, 0.0)),
+                "r2x": float(r2x_axis),
             }
             axis_summaries.append(entry)
             rms_values.append(axis_rms)
+            if entry.get("is_primary"):
+                primary_entry = entry
         if rms_values:
             # Calcular el RMS global como media cuadrática de los ejes evaluados
             # evitando que ejecuciones previas influyan en el resultado.
@@ -3517,14 +3556,21 @@ class MainApp:
                 "emoji_label": self._classify_severity(global_rms),
                 "color": global_color,
                 "is_global": True,
+                "is_primary": False,
+                "ml_bundle": None,
+                "ml_summary": None,
+                "frac_high": None,
+                "r2x": None,
             }
             axis_summaries.insert(0, global_entry)
-        primary = None
-        if axis_summaries:
-            primary = next((entry for entry in axis_summaries if entry.get("is_global")), axis_summaries[0])
+        if primary_entry is None and axis_summaries:
+            primary_entry = next(
+                (entry for entry in axis_summaries if not entry.get("is_global")),
+                axis_summaries[0],
+            )
         self._last_axis_severity = axis_summaries
-        self._last_primary_severity = primary
-        return axis_summaries, primary
+        self._last_primary_severity = primary_entry
+        return axis_summaries, primary_entry
 
     # Helpers de lectura segura de campos
     def _fldf(self, fld):
@@ -3815,6 +3861,11 @@ class MainApp:
                 env_hi_val,
                 df=self.current_df,
                 unit_map=unit_map_local,
+                primary_axis=fft_signal_col,
+            )
+            global_entry_pdf = next(
+                (entry for entry in axis_summaries_pdf if entry.get("is_global")),
+                None,
             )
             if primary_entry_pdf is None:
                 primary_entry_pdf = {
@@ -3825,6 +3876,16 @@ class MainApp:
                     "emoji_label": self._classify_severity(selected_rms_mm),
                     "color": selected_color,
                     "is_global": False,
+                    "is_primary": True,
+                    "ml_bundle": ml_bundle_pdf,
+                    "ml_summary": self._resolve_ml_summary(
+                        ml_bundle_pdf,
+                        selected_label,
+                        0.0,
+                        float(res.get('fft', {}).get('r2x', 0.0)),
+                    ),
+                    "frac_high": 0.0,
+                    "r2x": float(res.get('fft', {}).get('r2x', 0.0)),
                 }
                 self._last_primary_severity = primary_entry_pdf
                 if not getattr(self, "_last_axis_severity", []):
@@ -3834,6 +3895,16 @@ class MainApp:
             primary_rms_mm_pdf = float(primary_entry_pdf.get("rms_mm_s", selected_rms_mm))
             primary_label_pdf = primary_entry_pdf.get("iso_label", selected_label)
             primary_color_pdf = primary_entry_pdf.get("color", selected_color)
+            primary_name_pdf = primary_entry_pdf.get("name", self._axis_display_name(fft_signal_col))
+            primary_ml_bundle = primary_entry_pdf.get("ml_bundle") or ml_bundle_pdf
+            ml_bundle_pdf = primary_ml_bundle or {}
+            ml_result_pdf = (ml_bundle_pdf or {}).get('result') or {}
+            ml_features_bundle = (ml_bundle_pdf or {}).get('features') or {}
+            global_rms_mm_pdf = float(
+                (global_entry_pdf or {}).get("rms_mm_s", primary_rms_mm_pdf)
+            )
+            global_label_pdf = (global_entry_pdf or {}).get("iso_label", primary_label_pdf)
+            global_color_pdf = (global_entry_pdf or {}).get("color", primary_color_pdf)
             axis_display_name = self._axis_display_name(fft_signal_col)
 
             features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
@@ -3856,20 +3927,30 @@ class MainApp:
             charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
             if not charlotte_catalog_pdf:
                 charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
-            severity_mm = self._classify_severity(primary_rms_mm_pdf)
+            severity_axis_label = self._classify_severity(primary_rms_mm_pdf)
+            severity_global_label = global_label_pdf or self._classify_severity(global_rms_mm_pdf)
             rms_mm = primary_rms_mm_pdf
             axis_table_rows: List[List[str]] = []
             if axis_summaries_pdf:
-                axis_table_rows.append(["Canal", "RMS (mm/s)", "Clasificación ISO"])
+                axis_table_rows.append(["Canal", "RMS (mm/s)", "Clasificación ISO", "ML (híbrido)"])
                 for entry in axis_summaries_pdf:
                     try:
                         rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f}"
                     except Exception:
                         rms_txt = "N/D"
+                    ml_summary_entry = entry.get("ml_summary") or {}
+                    ml_status_entry = str(ml_summary_entry.get("status") or "").lower()
+                    if ml_status_entry == "ok":
+                        ml_txt = ml_summary_entry.get("final_label") or ml_summary_entry.get("ml_label") or "OK"
+                    elif ml_status_entry:
+                        ml_txt = "No disp."
+                    else:
+                        ml_txt = "—"
                     axis_table_rows.append([
                         entry.get("name", "Eje"),
                         rms_txt,
                         entry.get("iso_label", "N/D"),
+                        ml_txt,
                     ])
 
             try:
@@ -4625,19 +4706,19 @@ class MainApp:
             elements.append(Spacer(1, 12))
 
             metric_tiles = _build_metric_tiles([
-                (f"{primary_rms_mm_pdf:.3f} mm/s", "RMS global"),
-                (primary_label_pdf, "Clasificación ISO"),
+                (f"{global_rms_mm_pdf:.3f} mm/s", "RMS global"),
+                (global_label_pdf, "Clasificación ISO global"),
                 (f"{features_full['dom_freq']:.2f} Hz", "Frecuencia dominante"),
             ])
             if metric_tiles is not None:
                 elements.append(metric_tiles)
                 elements.append(Spacer(1, 10))
 
-            severity_table = _build_severity_semaphore(severity_mm)
+            severity_table = _build_severity_semaphore(severity_global_label)
             overview_body: List[Any] = [
                 Paragraph("Resumen ejecutivo", styles['HeadingAccent']),
                 Paragraph(
-                    f"La condición global del activo es <b>{severity_mm}</b> con una vibración global de {primary_rms_mm_pdf:.3f} mm/s.",
+                    f"La condición global del activo es <b>{severity_global_label}</b> con una vibración global de {global_rms_mm_pdf:.3f} mm/s.",
                     styles['Normal'],
                 ),
             ]
@@ -4697,9 +4778,10 @@ class MainApp:
             if axis_table_rows:
                 inner_axis_width = doc.width - 32
                 col_layout = [
-                    inner_axis_width * 0.34,
-                    inner_axis_width * 0.27,
-                    inner_axis_width * 0.39,
+                    inner_axis_width * 0.3,
+                    inner_axis_width * 0.2,
+                    inner_axis_width * 0.25,
+                    inner_axis_width * 0.25,
                 ]
                 axis_table = Table(axis_table_rows, colWidths=col_layout)
                 axis_table.setStyle(
@@ -4745,12 +4827,12 @@ class MainApp:
 
             ml_summary_pdf = self._resolve_ml_summary(
                 ml_bundle_pdf,
-                severity_mm,
+                severity_axis_label,
                 float(features_full.get('frac_high', 0.0)),
                 float(features_full.get('r2x', 0.0)),
             )
             ml_status_value = ml_summary_pdf["status"]
-            ml_label_display = str(ml_summary_pdf["final_label"] or severity_mm)
+            ml_label_display = str(ml_summary_pdf["final_label"] or severity_axis_label)
             iso_class_pdf = ml_summary_pdf["iso_label"]
             ml_class_pdf = ml_summary_pdf["ml_label"]
             conflict_pdf = ml_summary_pdf["conflict"]
@@ -4775,9 +4857,14 @@ class MainApp:
 
             comparison_rows = [
                 (
-                    "Norma ISO 10816/20816",
-                    f"{severity_mm} (RMS {primary_rms_mm_pdf:.3f} mm/s)",
-                    "Nivel vibratorio global supera el umbral recomendado para operación continua.",
+                    f"Norma ISO 10816/20816 ({primary_name_pdf})",
+                    f"{severity_axis_label} (RMS {primary_rms_mm_pdf:.3f} mm/s)",
+                    f"Evaluación del {primary_name_pdf} conforme a los umbrales ISO 10816/20816.",
+                ),
+                (
+                    "Norma ISO 10816/20816 (global)",
+                    f"{severity_global_label} (RMS {global_rms_mm_pdf:.3f} mm/s)",
+                    "RMS global calculado como media cuadrática de los ejes disponibles.",
                 ),
                 (
                     "Modelo Machine Learning",
@@ -4789,7 +4876,7 @@ class MainApp:
             if ml_status_value == 'ok':
                 ml_base = ml_class_pdf or ml_label_display
                 discrepancy_note = (
-                    f"Nota sobre el diagnóstico: la norma ISO clasifica esta medición como <b>{severity_mm}</b> (RMS <b>{primary_rms_mm_pdf:.3f} mm/s</b>). "
+                    f"Nota sobre el diagnóstico: la norma ISO para {primary_name_pdf} clasifica esta medición como <b>{severity_axis_label}</b> (RMS <b>{primary_rms_mm_pdf:.3f} mm/s</b>). "
                     f"El modelo ML identifica la condición como <b>{ml_base}</b> apoyándose en la energía de alta frecuencia ({frac_high_pct:.1f}%) y en una relación 2X de {ml_r2x:.2f}. "
                     f"El esquema híbrido ISO+ML adopta finalmente la condición <b>{ml_label_display}</b>."
                 )
@@ -4807,10 +4894,17 @@ class MainApp:
             diagnostic_contents: List[Any] = [
                 Paragraph("Diagnóstico consolidado", styles['CardTitle']),
                 Paragraph(
-                    f"El valor RMS calculado es <b>{rms_mm:.3f} mm/s</b>, lo que corresponde a la condición <b>{severity_mm}</b>.",
+                    f"El {primary_name_pdf.lower()} presenta un RMS de <b>{rms_mm:.3f} mm/s</b>, equivalente a la condición <b>{severity_axis_label}</b> según ISO 10816/20816.",
                     styles['Normal'],
                 ),
             ]
+            if global_entry_pdf:
+                diagnostic_contents.append(
+                    Paragraph(
+                        f"El RMS global combinado es <b>{global_rms_mm_pdf:.3f} mm/s</b> → <b>{severity_global_label}</b>.",
+                        styles['Normal'],
+                    )
+                )
             if comparison_table is not None:
                 diagnostic_contents.append(Spacer(1, 6))
                 diagnostic_contents.append(comparison_table)
@@ -4990,12 +5084,12 @@ class MainApp:
                     elements.append(Spacer(1, 8))
 
             try:
-                final_condition_pdf = ml_label_display if ml_status_value == 'ok' and ml_label_display else severity_mm
+                final_condition_pdf = ml_label_display if ml_status_value == 'ok' and ml_label_display else severity_axis_label
                 energy_low_pct = float(features_full.get('frac_low', 0.0)) * 100.0
                 energy_mid_pct = float(features_full.get('frac_mid', 0.0)) * 100.0
                 energy_high_pct = float(features_full.get('frac_high', 0.0)) * 100.0
             except Exception:
-                final_condition_pdf = severity_mm
+                final_condition_pdf = severity_axis_label
                 energy_low_pct = energy_mid_pct = energy_high_pct = 0.0
             try:
                 dom_freq_pdf = float(res.get('fft', {}).get('dom_freq_hz', features_full.get('dom_freq', 0.0)))
@@ -5024,7 +5118,7 @@ class MainApp:
             conclusion_parts_pdf.append(
                 f"La maquina se encuentra en condicion <b>{final_condition_pdf}</b>.")
             conclusion_parts_pdf.append(
-                f"Se midio una vibracion global de {primary_rms_mm_pdf:.3f} mm/s; la referencia ISO 10816/20816 la ubica en el estado {severity_mm}.")
+                f"Se midio una vibracion global de {global_rms_mm_pdf:.3f} mm/s; la referencia ISO 10816/20816 la ubica en el estado {severity_global_label}.")
             conclusion_parts_pdf.append(
                 f"La energia del espectro se reparte en bajas {energy_low_pct:.1f}%, medias {energy_mid_pct:.1f}% y altas {energy_high_pct:.1f}%; la componente mas marcada aparece cerca de {dom_freq_txt}.")
             if ml_status_value == 'ok':
@@ -8276,7 +8370,7 @@ class MainApp:
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                fig.tight_layout()
+                fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.98))
             return fig
         except Exception:
             return None
@@ -8332,23 +8426,95 @@ class MainApp:
                     filtered = base
                 return filtered
 
-            x_filt = _band_filter(x)
-            y_filt = _band_filter(y)
-            finite = np.isfinite(x_filt) & np.isfinite(y_filt)
+            def _smooth_signal(arr: np.ndarray, samples: int) -> np.ndarray:
+                base = np.asarray(arr, dtype=float)
+                if base.size < 3:
+                    return base
+                win = max(3, samples)
+                if win % 2 == 0:
+                    win = win + 1 if win < base.size else win - 1
+                if win < 3:
+                    return base
+                window = np.hanning(win)
+                if not np.any(window):
+                    window = np.ones(win)
+                window = window / np.sum(window)
+                return np.convolve(base, window, mode="same")
+
+            x_band = _band_filter(x)
+            y_band = _band_filter(y)
+            finite = np.isfinite(x_band) & np.isfinite(y_band)
             if np.count_nonzero(finite) < 16:
                 return None
-            x_filt = x_filt[finite]
-            y_filt = y_filt[finite]
-            if x_filt.size > 6000:
-                idx = np.linspace(0, x_filt.size - 1, 3000, dtype=int)
-                x_filt = x_filt[idx]
-                y_filt = y_filt[idx]
-            if x_filt.size < 16 or y_filt.size < 16:
+            x_band = x_band[finite]
+            y_band = y_band[finite]
+            if x_band.size > 6000:
+                idx = np.linspace(0, x_band.size - 1, 3000, dtype=int)
+                x_band = x_band[idx]
+                y_band = y_band[idx]
+            if x_band.size < 16 or y_band.size < 16:
                 return None
+            smooth_window = max(5, min(51, int(max(x_band.size, y_band.size) / 50) | 1))
+            x_smooth = _smooth_signal(x_band, smooth_window)
+            y_smooth = _smooth_signal(y_band, smooth_window)
+            radial_smooth = np.hypot(x_smooth, y_smooth)
+            keep_mask = np.isfinite(radial_smooth)
+            try:
+                if np.count_nonzero(keep_mask) >= 16:
+                    perc = np.nanpercentile(radial_smooth[keep_mask], 99.0)
+                    if np.isfinite(perc) and perc > 0:
+                        keep_mask &= radial_smooth <= (perc * 1.1)
+            except Exception:
+                pass
+            if np.count_nonzero(keep_mask) < 16:
+                keep_mask = np.isfinite(radial_smooth)
+            x_orig = x_band[keep_mask]
+            y_orig = y_band[keep_mask]
+            x_filt = x_smooth[keep_mask]
+            y_filt = y_smooth[keep_mask]
+            radial_source = np.hypot(x_orig, y_orig)
             stack = np.vstack((x_filt, y_filt))
-            radial_source = np.hypot(x_filt, y_filt)
-            x_plot = x_filt
-            y_plot = y_filt
+            def _resample_path(x_vals: np.ndarray, y_vals: np.ndarray, limit: int = 850):
+                points = min(int(limit), int(min(x_vals.size, y_vals.size)))
+                if points <= 0:
+                    return x_vals, y_vals, np.linspace(0.0, 1.0, x_vals.size, dtype=float), np.arange(x_vals.size, dtype=float)
+                if x_vals.size <= points:
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                diffs_x = np.diff(x_vals)
+                diffs_y = np.diff(y_vals)
+                seg = np.hypot(diffs_x, diffs_y)
+                if not np.any(np.isfinite(seg)):
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                seg = np.nan_to_num(seg, nan=0.0, posinf=0.0, neginf=0.0)
+                cumulative = np.concatenate(([0.0], np.cumsum(seg)))
+                total = cumulative[-1]
+                if total <= 0:
+                    prog = np.linspace(0.0, 1.0, x_vals.size, dtype=float)
+                    idx_map = np.arange(x_vals.size, dtype=float)
+                    return x_vals, y_vals, prog, idx_map
+                target_dist = np.linspace(0.0, total, points)
+                x_res = np.interp(target_dist, cumulative, x_vals)
+                y_res = np.interp(target_dist, cumulative, y_vals)
+                idx_map = np.interp(target_dist, cumulative, np.arange(x_vals.size, dtype=float))
+                prog = target_dist / total
+                return x_res, y_res, prog, idx_map
+
+            def _center_curve(x_vals: np.ndarray, y_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+                if not x_vals.size or not y_vals.size:
+                    return x_vals, y_vals
+                return x_vals - np.nanmedian(x_vals), y_vals - np.nanmedian(y_vals)
+
+            x_centered, y_centered = _center_curve(x_filt, y_filt)
+            x_plot, y_plot, progress_map, sample_map = _resample_path(x_centered, y_centered)
+            if x_plot.size >= 11:
+                kernel = np.ones(11, dtype=float)
+                kernel = kernel / np.sum(kernel)
+                x_plot = np.convolve(x_plot, kernel, mode="same")
+                y_plot = np.convolve(y_plot, kernel, mode="same")
             overlay_original = False
             balance_note = None
             corr_val = None
@@ -8396,32 +8562,81 @@ class MainApp:
                 y_plot = balanced[1]
                 overlay_original = True
                 balance_note = "Órbita auto-equilibrada (señales muy correlacionadas)"
+            def _orbit_interpretation(eig_ratio_val: Optional[float], corr: Optional[float]) -> Tuple[str, str, str]:
+                ratio = eig_ratio_val if eig_ratio_val is not None and np.isfinite(eig_ratio_val) else None
+                rho = corr if corr is not None and np.isfinite(corr) else None
+                shape = "Indeterminada"
+                detail = "datos insuficientes para clasificar la órbita."
+                color = "#3498db"
+                if rho is not None and abs(rho) >= 0.92:
+                    shape = "Lineal"
+                    detail = "trayectoria casi lineal — revisar alineación de sensores o rigidez excesiva."
+                    color = "#e74c3c"
+                    return shape, detail, color
+                if ratio is None:
+                    return shape, detail, color
+                if rho is not None and rho < -0.45 and ratio >= 1.6:
+                    shape = "Forma en 8"
+                    detail = "posible holgura o juego excesivo."
+                    color = "#e67e22"
+                    return shape, detail, color
+                if ratio < 1.4:
+                    shape = "Circular"
+                    detail = "balanceo predominante y movimiento uniforme."
+                    color = "#2ecc71"
+                elif ratio < 6.0:
+                    shape = "Elíptica"
+                    detail = "posible desalineación o rigidez desigual."
+                    color = "#f1c40f"
+                else:
+                    shape = "Distorsionada"
+                    detail = "órbita deformada — verificar holguras, impactos o resonancia."
+                    color = "#e67e22"
+                return shape, detail, color
+
+            shape_label, shape_detail, shape_color = _orbit_interpretation(eig_ratio, corr_val)
+            radial_plot = np.hypot(x_plot, y_plot)
+            if radial_source.size and sample_map.size:
+                try:
+                    radial_labels = np.interp(sample_map, np.arange(radial_source.size, dtype=float), radial_source)
+                except Exception:
+                    radial_labels = radial_plot
+            else:
+                radial_labels = radial_plot
+            def _tone_color(hex_color: str, dark: bool, blend: float = 0.25) -> str:
+                try:
+                    base_rgb = np.array(mpl.colors.to_rgb(hex_color))
+                    background = "#0f141b" if dark else "#ffffff"
+                    bg_rgb = np.array(mpl.colors.to_rgb(background))
+                    mixed = np.clip(base_rgb * (1.0 - blend) + bg_rgb * blend, 0.0, 1.0)
+                    return mpl.colors.to_hex(mixed)
+                except Exception:
+                    return hex_color
             face = "#0f141b" if dark_mode else "white"
-            fig, ax = plt.subplots(figsize=(6, 6))
+            fig, ax = plt.subplots(figsize=(6.4, 5.9))
             fig.patch.set_facecolor(face)
             ax.set_facecolor(face)
-            accent = self._accent_ui()
+            accent = _tone_color(shape_color if shape_color else self._accent_ui(), dark_mode, blend=0.2)
             if overlay_original:
                 ax.plot(
-                    x_filt,
-                    y_filt,
+                    x_orig,
+                    y_orig,
                     color="#95a5a6",
                     linewidth=0.9,
                     alpha=0.5,
                     label="Original (sin balance)",
                 )
-            ax.plot(x_plot, y_plot, color=accent, linewidth=1.4, alpha=0.9)
-            progress = np.linspace(0.0, 1.0, x_plot.size, dtype=float)
+            ax.plot(x_plot, y_plot, color=accent, linewidth=1.6, alpha=0.95)
             sc = ax.scatter(
                 x_plot,
                 y_plot,
-                c=progress,
+                c=progress_map,
                 cmap="plasma",
                 s=10,
                 alpha=0.6,
                 linewidths=0,
             )
-            radial = np.hypot(x_plot, y_plot)
+            radial = radial_plot
             try:
                 span = float(np.nanpercentile(np.concatenate((np.abs(x_plot), np.abs(y_plot))), 99.5))
             except Exception:
@@ -8436,20 +8651,24 @@ class MainApp:
                 top_n = min(3, radial.size)
                 peak_idx = np.argpartition(radial, -top_n)[-top_n:]
                 peak_idx = peak_idx[np.argsort(radial[peak_idx])[::-1]]
+                peak_face = _tone_color("#f39c12" if not dark_mode else "#f1c40f", dark_mode, blend=0.15)
+                edge = _tone_color("#2c3e50" if not dark_mode else "#1a252f", dark_mode, blend=0.05)
                 ax.scatter(
                     x_plot[peak_idx],
                     y_plot[peak_idx],
-                    color="#f9ca24",
-                    edgecolors="#2c3e50",
+                    color=peak_face,
+                    edgecolors=edge,
                     linewidths=0.6,
                     marker="*",
-                    s=90,
+                    s=88,
                     label="Picos máximos",
                     zorder=6,
                 )
             try:
-                ax.scatter([x_plot[0]], [y_plot[0]], color="#2ecc71", s=50, label="Inicio")
-                ax.scatter([x_plot[-1]], [y_plot[-1]], color="#e74c3c", s=50, label="Fin")
+                start_color = _tone_color("#1abc9c" if not dark_mode else "#48dbfb", dark_mode, blend=0.1)
+                end_color = _tone_color("#e74c3c" if not dark_mode else "#ff6b6b", dark_mode, blend=0.1)
+                ax.scatter([x_plot[0]], [y_plot[0]], color=start_color, s=54, label="Inicio")
+                ax.scatter([x_plot[-1]], [y_plot[-1]], color=end_color, s=54, label="Fin")
             except Exception:
                 pass
             ax.set_title("Análisis de órbita")
@@ -8461,7 +8680,7 @@ class MainApp:
             ax.axvline(0.0, color=axis_color, linewidth=0.8, alpha=0.2)
             if peak_idx.size:
                 for idx_peak in peak_idx:
-                    raw_val = float(radial_source[idx_peak]) if idx_peak < radial_source.size else float(radial[idx_peak])
+                    raw_val = float(radial_labels[idx_peak]) if idx_peak < radial_labels.size else float(radial[idx_peak])
                     ax.text(
                         x_plot[idx_peak],
                         y_plot[idx_peak],
@@ -8479,32 +8698,38 @@ class MainApp:
             for axis in [ax.xaxis, ax.yaxis]:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
-            info_lines = []
-            if corr_val is not None and np.isfinite(corr_val):
-                info_lines.append(f"ρ(X,Y) = {corr_val:.3f}")
-            if std_x is not None and std_y is not None and std_y > 0:
-                info_lines.append(f"σx/σy = {(std_x / std_y):.2f}")
-            if eig_ratio is not None and np.isfinite(eig_ratio):
-                info_lines.append(f"κ = {eig_ratio:.1f}")
-            if info_lines:
-                ax.text(
-                    0.02,
-                    0.98,
-                    "\n".join(info_lines),
-                    transform=ax.transAxes,
-                    fontsize=8,
-                    color=axis_color,
-                    va="top",
-                )
+            headline = f"Forma detectada: {shape_label} — {shape_detail}"
+            wrapped_headline = "\n".join(textwrap.wrap(headline, width=70))
+            fig.subplots_adjust(left=0.12, right=0.96, top=0.84, bottom=0.18)
+            fig.text(
+                0.5,
+                0.89,
+                wrapped_headline,
+                ha="center",
+                va="bottom",
+                color=shape_color,
+                fontsize=11,
+                fontweight="bold",
+            )
+            legend_text = "Forma: circular=balanceo | elíptica=desalineación | 8=holgura"
+            fig.text(
+                0.5,
+                0.12,
+                legend_text,
+                ha="center",
+                va="bottom",
+                color=axis_color,
+                fontsize=8,
+            )
             if balance_note:
-                ax.text(
-                    0.02,
-                    0.02,
+                fig.text(
+                    0.5,
+                    0.15,
                     balance_note,
-                    transform=ax.transAxes,
-                    fontsize=8,
-                    color=axis_color,
+                    ha="center",
                     va="bottom",
+                    fontsize=7,
+                    color=axis_color,
                     bbox=dict(
                         boxstyle="round,pad=0.25",
                         facecolor="#1b2633" if dark_mode else "white",
@@ -8521,9 +8746,6 @@ class MainApp:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(loc="upper right", fontsize=8)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                fig.tight_layout()
             return fig
         except Exception:
             return None
@@ -9649,6 +9871,11 @@ class MainApp:
                 env_hi_val,
                 df=df_limpio,
                 unit_map=unit_map_local,
+                primary_axis=fft_signal_col,
+            )
+            global_entry = next(
+                (entry for entry in axis_summaries if entry.get("is_global")),
+                None,
             )
             if primary_entry is None:
                 primary_entry = {
@@ -9659,6 +9886,16 @@ class MainApp:
                     "emoji_label": self._classify_severity(selected_rms_mm),
                     "color": selected_color,
                     "is_global": False,
+                    "is_primary": True,
+                    "ml_bundle": res.get('ml', {}),
+                    "ml_summary": self._resolve_ml_summary(
+                        res.get('ml', {}),
+                        selected_label,
+                        float(frac_high) if 'frac_high' in locals() else 0.0,
+                        float(res.get('fft', {}).get('r2x', 0.0)),
+                    ),
+                    "frac_high": float(frac_high) if 'frac_high' in locals() else 0.0,
+                    "r2x": float(res.get('fft', {}).get('r2x', 0.0)),
                 }
                 self._last_primary_severity = primary_entry
                 if not getattr(self, "_last_axis_severity", []):
@@ -9668,6 +9905,19 @@ class MainApp:
             primary_rms_mm = float(primary_entry.get("rms_mm_s", selected_rms_mm))
             primary_label = primary_entry.get("iso_label", selected_label)
             primary_color = primary_entry.get("color", selected_color)
+            primary_name = primary_entry.get("name", self._axis_display_name(fft_signal_col))
+            primary_ml_summary = primary_entry.get("ml_summary")
+            if not primary_ml_summary:
+                primary_ml_summary = self._resolve_ml_summary(
+                    primary_entry.get("ml_bundle"),
+                    primary_label,
+                    float(primary_entry.get("frac_high", 0.0) or 0.0),
+                    float(primary_entry.get("r2x", 0.0) or 0.0),
+                )
+                primary_entry["ml_summary"] = primary_ml_summary
+            global_rms_mm = float((global_entry or {}).get("rms_mm_s", primary_rms_mm))
+            global_label = (global_entry or {}).get("iso_label", primary_label)
+            global_color = (global_entry or {}).get("color", primary_color)
             raw_findings = res.get('diagnosis', [])
             findings_core = list(res.get('diagnosis_findings', []) or [])
             if not findings_core and raw_findings:
@@ -9692,7 +9942,24 @@ class MainApp:
             except Exception:
                 frac_low = frac_mid = frac_high = 0.0
             try:
-                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {primary_rms_mm:.3f} mm/s → {primary_label}.")
+                primary_entry["frac_high"] = float(frac_high)
+            except Exception:
+                pass
+            if primary_entry.get("ml_bundle"):
+                try:
+                    primary_entry["ml_summary"] = self._resolve_ml_summary(
+                        primary_entry.get("ml_bundle"),
+                        primary_label,
+                        float(primary_entry.get("frac_high", frac_high) or 0.0),
+                        float(primary_entry.get("r2x", 0.0) or 0.0),
+                    )
+                    primary_ml_summary = primary_entry["ml_summary"]
+                except Exception:
+                    pass
+            try:
+                exp_lines.append(
+                    f"Severidad {primary_name}: {primary_rms_mm:.3f} mm/s → {primary_label}."
+                )
             except Exception:
                 pass
             def _has(txt: str) -> bool:
@@ -10474,6 +10741,20 @@ class MainApp:
                     except Exception:
                         value_txt = "N/D"
                     color_hex = entry.get("color", "#7f8c8d")
+                    ml_summary = entry.get("ml_summary") or {}
+                    ml_status = str(ml_summary.get("status") or "").lower()
+                    if ml_status == "ok":
+                        ml_text = ml_summary.get("final_label") or ml_summary.get("ml_label") or "OK"
+                        ml_color = self._accent_ui()
+                    elif ml_status:
+                        ml_text = ml_summary.get("message") or "ML no disponible"
+                        ml_color = "#7f8c8d"
+                    else:
+                        ml_text = "Sin resultado ML"
+                        ml_color = "#7f8c8d"
+                    label_txt = entry.get("name", "Eje")
+                    if entry.get("is_primary"):
+                        label_txt = f"{label_txt} (analizado)"
                     controls.append(
                         ft.Container(
                             expand=True,
@@ -10487,8 +10768,8 @@ class MainApp:
                                                 color=color_hex,
                                             ),
                                             ft.Text(
-                                                entry.get("name", "Eje"),
-                                                weight="bold" if entry.get("is_global") else None,
+                                                label_txt,
+                                                weight="bold" if entry.get("is_global") or entry.get("is_primary") else None,
                                                 expand=True,
                                                 max_lines=1,
                                                 overflow=ft.TextOverflow.ELLIPSIS,
@@ -10518,6 +10799,12 @@ class MainApp:
                                         alignment="spaceBetween",
                                         vertical_alignment="center",
                                     ),
+                                    ft.Text(
+                                        f"ML: {ml_text}",
+                                        size=11,
+                                        color=ml_color,
+                                        text_align=ft.TextAlign.LEFT,
+                                    ),
                                 ],
                                 spacing=6,
                             ),
@@ -10533,7 +10820,7 @@ class MainApp:
 
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
-                sev_label, sev_color = primary_label, primary_color
+                sev_label, sev_color = global_label, global_color
             except Exception:
                 sev_label, sev_color = "N/D", "#7f8c8d"
             exec_findings_all = list(findings)
@@ -10570,7 +10857,7 @@ class MainApp:
                             padding=ft.padding.symmetric(horizontal=14, vertical=8),
                         ),
                         ft.Text(
-                            f"RMS global (mm/s): {primary_rms_mm:.3f}",
+                            f"RMS global (mm/s): {global_rms_mm:.3f}",
                             weight="bold",
                             text_align=ft.TextAlign.LEFT,
                         ),
@@ -10578,7 +10865,7 @@ class MainApp:
                             f"Frecuencia dominante: {dom_freq:.2f} Hz",
                             text_align=ft.TextAlign.LEFT,
                         ),
-                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_severity_traffic_light(global_rms_mm),
                         self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
                         *axis_summary_controls_exec,
                         ft.Text(
@@ -10642,10 +10929,10 @@ class MainApp:
                             text_align=ft.TextAlign.LEFT,
                         ),
                         ft.Text(
-                            f"RMS velocidad global: {primary_rms_mm:.3f} mm/s",
+                            f"RMS velocidad global: {global_rms_mm:.3f} mm/s",
                             text_align=ft.TextAlign.LEFT,
                         ),
-                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_severity_traffic_light(global_rms_mm),
                         self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
                         *axis_summary_controls_main,
                         ft.Text(
@@ -10787,10 +11074,10 @@ class MainApp:
             ml_bundle_ui = res.get("ml", {}) if isinstance(res, dict) else {}
             features_ui_map = (ml_bundle_ui or {}).get("features") or {}
             try:
-                fallback_r2x_ui = float(features_ui_map.get("r2x", 0.0))
+                fallback_r2x_ui = float(primary_entry.get("r2x", 0.0) or features_ui_map.get("r2x", 0.0))
             except Exception:
                 fallback_r2x_ui = 0.0
-            ml_summary_ui = self._resolve_ml_summary(
+            ml_summary_ui = primary_ml_summary or self._resolve_ml_summary(
                 ml_bundle_ui,
                 primary_label,
                 float(frac_high),
@@ -10808,7 +11095,7 @@ class MainApp:
                 if conflict_ui:
                     diagnosis_note = "Se detecta diferencia relevante entre ISO y ML; revisar mediciones complementarias."
                 else:
-                    diagnosis_note = "ISO y ML coinciden en la severidad global reportada."
+                    diagnosis_note = "ISO y ML coinciden en la severidad reportada."
             else:
                 diagnosis_note = ml_message_ui or "El diagnostico final se basa en el criterio ISO por ausencia del modelo ML."
 
@@ -10831,7 +11118,9 @@ class MainApp:
             conclusion_parts_ui.append(
                 f"La maquina se encuentra en condicion {final_label_ui}.")
             conclusion_parts_ui.append(
-                f"Se midio una vibracion global de {primary_rms_mm:.3f} mm/s segun la norma ISO 10816/20816 esto equivale a un estado {iso_label_ui}.")
+                f"El {primary_name.lower()} registra {primary_rms_mm:.3f} mm/s → {primary_label} (ISO 10816/20816).")
+            conclusion_parts_ui.append(
+                f"Se midio una vibracion global de {global_rms_mm:.3f} mm/s segun la norma ISO 10816/20816 esto equivale a un estado {global_label}.")
             if dom_freq_val_ui is not None:
                 conclusion_parts_ui.append(
                     f"La componente dominante aparece alrededor de {dom_freq_val_ui:.2f} Hz.")
