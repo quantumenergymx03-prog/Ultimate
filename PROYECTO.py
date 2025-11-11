@@ -15,6 +15,7 @@ import re
 import joblib
 import warnings
 import json
+import textwrap
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -8556,7 +8557,7 @@ class MainApp:
 
             shape_label, shape_detail, shape_color = _orbit_interpretation(eig_ratio, corr_val)
             face = "#0f141b" if dark_mode else "white"
-            fig, ax = plt.subplots(figsize=(6, 6))
+            fig, ax = plt.subplots(figsize=(6.4, 5.9))
             fig.patch.set_facecolor(face)
             ax.set_facecolor(face)
             accent = shape_color if shape_color else self._accent_ui()
@@ -8569,7 +8570,7 @@ class MainApp:
                     alpha=0.5,
                     label="Original (sin balance)",
                 )
-            ax.plot(x_plot, y_plot, color=accent, linewidth=1.4, alpha=0.9)
+            ax.plot(x_plot, y_plot, color=accent, linewidth=1.6, alpha=0.95)
             progress = np.linspace(0.0, 1.0, x_plot.size, dtype=float)
             sc = ax.scatter(
                 x_plot,
@@ -8595,20 +8596,24 @@ class MainApp:
                 top_n = min(3, radial.size)
                 peak_idx = np.argpartition(radial, -top_n)[-top_n:]
                 peak_idx = peak_idx[np.argsort(radial[peak_idx])[::-1]]
+                peak_face = "#f39c12" if not dark_mode else "#f1c40f"
+                edge = "#2c3e50" if not dark_mode else "#1a252f"
                 ax.scatter(
                     x_plot[peak_idx],
                     y_plot[peak_idx],
-                    color="#f9ca24",
-                    edgecolors="#2c3e50",
+                    color=peak_face,
+                    edgecolors=edge,
                     linewidths=0.6,
                     marker="*",
-                    s=90,
+                    s=88,
                     label="Picos máximos",
                     zorder=6,
                 )
             try:
-                ax.scatter([x_plot[0]], [y_plot[0]], color="#2ecc71", s=50, label="Inicio")
-                ax.scatter([x_plot[-1]], [y_plot[-1]], color="#e74c3c", s=50, label="Fin")
+                start_color = "#27ae60" if not dark_mode else "#2ecc71"
+                end_color = "#c0392b" if not dark_mode else "#ff6b6b"
+                ax.scatter([x_plot[0]], [y_plot[0]], color=start_color, s=54, label="Inicio")
+                ax.scatter([x_plot[-1]], [y_plot[-1]], color=end_color, s=54, label="Fin")
             except Exception:
                 pass
             ax.set_title("Análisis de órbita")
@@ -8639,11 +8644,12 @@ class MainApp:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
             headline = f"Forma detectada: {shape_label} — {shape_detail}"
-            ax.text(
+            wrapped_headline = "\n".join(textwrap.wrap(headline, width=70))
+            fig.subplots_adjust(left=0.12, right=0.96, top=0.84, bottom=0.18)
+            fig.text(
                 0.5,
-                1.05,
-                headline,
-                transform=ax.transAxes,
+                0.89,
+                wrapped_headline,
                 ha="center",
                 va="bottom",
                 color=shape_color,
@@ -8653,7 +8659,7 @@ class MainApp:
             legend_text = "Forma: circular=balanceo | elíptica=desalineación | 8=holgura"
             fig.text(
                 0.5,
-                0.02,
+                0.12,
                 legend_text,
                 ha="center",
                 va="bottom",
@@ -8663,7 +8669,7 @@ class MainApp:
             if balance_note:
                 fig.text(
                     0.5,
-                    0.045,
+                    0.15,
                     balance_note,
                     ha="center",
                     va="bottom",
@@ -8685,9 +8691,6 @@ class MainApp:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(loc="upper right", fontsize=8)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                fig.tight_layout(rect=(0.0, 0.1, 1.0, 0.94))
             return fig
         except Exception:
             return None
